@@ -89,79 +89,135 @@ def fetch_work_hours(cookie_jar, annotator_id):
         print(f"Error fetching work hours: {e}")
         return None
 
-def save_to_db(data1, data2):
-    if not data1 or not data1.get('issuccess') or not data2 or not data2.get('issuccess'):
-        print("No data available to save.")
+def save_to_db(qc_data, work_data):
+    if not qc_data or not qc_data.get('issuccess'):
+        print("No QC data available to save.")
+        return
+    
+    if not work_data or not work_data.get('issuccess'):
+        print("No work hours data available to save.")
         return
 
-    # Process data1 into combined DataFrame
-    records1 = data1['data']
-    df1 = pd.DataFrame(records1)
-    df1 = df1[(df1[['totalPostQC', 'totalPostApproved', 'totalPostSkiped', 'totalPostReannotated',
-                    'totalCommentQC', 'totalCommentApproved', 'totalCommentSkiped', 'totalCommentReannotated']] != 0).any(axis=1)]
+    # Get total work hours for the day
+    work_records = work_data['data']
+    total_work_hours = 0
+    if work_records:
+        work_df = pd.DataFrame(work_records)
+        total_work_hours = work_df['totalWorkHour'].iloc[0] if not work_df.empty else 0
 
-    post_qc_df = df1[['date', 'totalPostQC', 'totalPostApproved', 'totalPostSkiped', 'totalPostReannotated']].rename(columns={
-        'totalPostQC': 'total_qc_post_qc',
-        'totalPostApproved': 'approved_post',
-        'totalPostSkiped': 'skipped_post',
-        'totalPostReannotated': 'reannotated_post'
-    })
-
-    comment_qc_df = df1[['date', 'totalCommentQC', 'totalCommentApproved', 'totalCommentSkiped', 'totalCommentReannotated']].rename(columns={
-        'totalCommentQC': 'total_qc_comment_qc',
-        'totalCommentApproved': 'approved_comment',
-        'totalCommentSkiped': 'skipped_comment',
-        'totalCommentReannotated': 'reannotated_comment'
-    })
-
-    combined_df = pd.merge(post_qc_df, comment_qc_df, on='date')
-
-    # Get total work hour from data2
-    records2 = data2['data']
-    df2 = pd.DataFrame(records2)
-    total_work_hour = df2['totalWorkHour'].iloc[0] if not df2.empty else 0
-
-    # Add work hour to the row
-    combined_df['total_work_hour'] = total_work_hour
-
+    # Process hourly QC data
+    qc_records = qc_data['data']
+    
     # Connect to SQLite database
     db_path = 'work_history.db'
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
-    # Create table if not exists
+    # Create table if not exists - better structure
     cursor.execute(f'''
         CREATE TABLE IF NOT EXISTS "{month_table_name}" (
-            date TEXT PRIMARY KEY,
-            total_qc_post_qc INTEGER,
-            approved_post INTEGER,
-            skipped_post INTEGER,
-            reannotated_post INTEGER,
-            total_qc_comment_qc INTEGER,
-            approved_comment INTEGER,
-            skipped_comment INTEGER,
-            reannotated_comment INTEGER,
-            total_work_hour REAL
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            hour TEXT NOT NULL,
+            post_qc INTEGER DEFAULT 0,
+            post_approved INTEGER DEFAULT 0,
+            post_skipped INTEGER DEFAULT 0,
+            post_reannotated INTEGER DEFAULT 0,
+            comment_qc INTEGER DEFAULT 0,
+            comment_approved INTEGER DEFAULT 0,
+            comment_skipped INTEGER DEFAULT 0,
+            comment_reannotated INTEGER DEFAULT 0,
+            UNIQUE(date, hour)
         )
     ''')
 
-    # Insert or update row for today
-    row = combined_df.iloc[0] if not combined_df.empty else None
-    if row is not None:
-        cursor.execute(f'''
-            INSERT OR REPLACE INTO "{month_table_name}" 
-            (date, total_qc_post_qc, approved_post, skipped_post, reannotated_post, 
-             total_qc_comment_qc, approved_comment, skipped_comment, reannotated_comment, total_work_hour)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            row['date'], row['total_qc_post_qc'], row['approved_post'], row['skipped_post'], row['reannotated_post'],
-            row['total_qc_comment_qc'], row['approved_comment'], row['skipped_comment'], row['reannotated_comment'],
-            row['total_work_hour']
-        ))
+    # Create daily summary table
+    cursor.execute(f'''
+        CREATE TABLE IF NOT EXISTS "{month_table_name}_daily_summary" (
+            date TEXT PRIMARY KEY,
+            total_post_qc INTEGER DEFAULT 0,
+            total_post_approved INTEGER DEFAULT 0,
+            total_post_skipped INTEGER DEFAULT 0,
+            total_post_reannotated INTEGER DEFAULT 0,
+            total_comment_qc INTEGER DEFAULT 0,
+            total_comment_approved INTEGER DEFAULT 0,
+            total_comment_skipped INTEGER DEFAULT 0,
+            total_comment_reannotated INTEGER DEFAULT 0,
+            total_work_hours REAL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    # Clear existing data for today
+    cursor.execute(f'DELETE FROM "{month_table_name}" WHERE date = ?', (today,))
+
+    # Insert hourly data (only non-zero hours)
+    daily_totals = {
+        'post_qc': 0, 'post_approved': 0, 'post_skipped': 0, 'post_reannotated': 0,
+        'comment_qc': 0, 'comment_approved': 0, 'comment_skipped': 0, 'comment_reannotated': 0
+    }
+
+    hours_worked = 0
+    
+    for record in qc_records:
+        hour = record['date']  # This is actually the hour like "07:00 AM"
+        
+        # Extract numeric values
+        post_qc = int(record['totalPostQC'])
+        post_approved = int(record['totalPostApproved'])
+        post_skipped = int(record['totalPostSkiped'])
+        post_reannotated = int(record['totalPostReannotated'])
+        comment_qc = int(record['totalCommentQC'])
+        comment_approved = int(record['totalCommentApproved'])
+        comment_skipped = int(record['totalCommentSkiped'])
+        comment_reannotated = int(record['totalCommentReannotated'])
+        
+        # Only save hours where there was actual work
+        if any([post_qc, post_approved, post_skipped, post_reannotated, 
+                comment_qc, comment_approved, comment_skipped, comment_reannotated]):
+            
+            cursor.execute(f'''
+                INSERT OR REPLACE INTO "{month_table_name}" 
+                (date, hour, post_qc, post_approved, post_skipped, post_reannotated,
+                 comment_qc, comment_approved, comment_skipped, comment_reannotated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (today, hour, post_qc, post_approved, post_skipped, post_reannotated,
+                  comment_qc, comment_approved, comment_skipped, comment_reannotated))
+            
+            hours_worked += 1
+            
+        # Add to daily totals
+        daily_totals['post_qc'] += post_qc
+        daily_totals['post_approved'] += post_approved
+        daily_totals['post_skipped'] += post_skipped
+        daily_totals['post_reannotated'] += post_reannotated
+        daily_totals['comment_qc'] += comment_qc
+        daily_totals['comment_approved'] += comment_approved
+        daily_totals['comment_skipped'] += comment_skipped
+        daily_totals['comment_reannotated'] += comment_reannotated
+
+    # Insert daily summary
+    cursor.execute(f'''
+        INSERT OR REPLACE INTO "{month_table_name}_daily_summary" 
+        (date, total_post_qc, total_post_approved, total_post_skipped, total_post_reannotated,
+         total_comment_qc, total_comment_approved, total_comment_skipped, total_comment_reannotated, total_work_hours)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (today, daily_totals['post_qc'], daily_totals['post_approved'], 
+          daily_totals['post_skipped'], daily_totals['post_reannotated'],
+          daily_totals['comment_qc'], daily_totals['comment_approved'],
+          daily_totals['comment_skipped'], daily_totals['comment_reannotated'], 
+          total_work_hours))
 
     conn.commit()
     conn.close()
-    print(f"Data saved to table {month_table_name} in {db_path} for {today}")
+    
+    print(f"✅ Data saved successfully!")
+    print(f"📅 Date: {today}")
+    print(f"⏰ Hours worked: {hours_worked}")
+    print(f"📊 Total Post QC: {daily_totals['post_qc']}")
+    print(f"📊 Total Comment QC: {daily_totals['comment_qc']}")
+    print(f"🕐 Total work hours: {total_work_hours}")
+    print(f"💾 Database: work_history.db")
 
 if __name__ == "__main__":
     # Load credentials from environment variables
@@ -178,9 +234,10 @@ if __name__ == "__main__":
         print("Failed to obtain cookies. Exiting.")
         exit(1)
 
-    data1 = fetch_qc_reports(cookie_jar, annotator_id)
-    data2 = fetch_work_hours(cookie_jar, annotator_id)
-    if data1 and data2:
-        save_to_db(data1, data2)
+    qc_data = fetch_qc_reports(cookie_jar, annotator_id)
+    work_data = fetch_work_hours(cookie_jar, annotator_id)
+    
+    if qc_data and work_data:
+        save_to_db(qc_data, work_data)
     else:
         print("Failed to fetch data.")
